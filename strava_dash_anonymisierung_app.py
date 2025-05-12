@@ -1,0 +1,216 @@
+import dash
+from dash import dcc, html, Input, Output, State, dash_table
+import pandas as pd
+import numpy as np
+import plotly.graph_objs as go
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+
+# Verfügbare Datensatzversionen (verschiedene k-Anonymitätsstufen)
+dataset_paths = {
+    'No Anonymization': 'data/strava_with_demographics.csv',
+    'k=2': 'data/strava_anonymized_k2.csv',
+    'k=5': 'data/strava_anonymized_k5.csv',
+    'k=20': 'data/strava_anonymized_k20.csv',
+    'k=50': 'data/strava_anonymized_k50.csv'
+}
+
+# Zielvariablen (QIDs)
+target_columns = ['age', 'height_cm', 'weight_kg']
+
+# Merkmale zur Vorhersage
+input_features = ['average_speed', 'max_speed', 'distance', 'total_elevation_gain', 'elev_high', 'kudos_count']
+user_input_features = ['average_speed', 'max_speed', 'distance']
+
+# Initialisiere Dash-App
+app = dash.Dash(__name__)
+app.title = "Rekonstruktionsangriff Demo Strava"
+
+# GUI Layout
+dataset_models = {}
+
+app.layout = html.Div([
+    dcc.Tabs(id='tabs', value='train', children=[
+        dcc.Tab(label='Modelltraining', value='train'),
+        dcc.Tab(label='Datenansicht', value='view'),
+        dcc.Tab(label='Eigene Eingabe', value='predict')
+    ]),
+    html.Div(id='tab-content')
+])
+
+# Tabs-Inhalte anzeigen
+@app.callback(Output('tab-content', 'children'), Input('tabs', 'value'))
+def display_tab(tab):
+    if tab == 'train':
+        return html.Div([
+            html.Label("Anteil der Trainingsdaten (%):"),
+            dcc.Slider(id='train-percent', min=10, max=90, step=10, value=20,
+                       marks={i: f'{i}%' for i in range(10, 100, 10)}),
+            html.Label("Anzahl Bäume im Random Forest:"),
+            dcc.Slider(id='n-trees', min=10, max=500, step=10, value=100,
+                       marks={i: str(i) for i in range(10, 501, 50)}),
+            html.Button('Trainieren', id='train-btn', n_clicks=0),
+            html.Div(id='train-status'),
+            html.Hr(),
+            html.Label("Datensatz für Angriff auswählen:"),
+            dcc.Dropdown(id='attack-set',
+                         options=[{'label': k, 'value': k} for k in dataset_paths],
+                         value='k=2'),
+            html.Button('Angriff starten', id='attack-btn', n_clicks=0),
+            html.Div(id='attack-status'),
+            dash_table.DataTable(id='attack-metrics', style_table={'overflowX': 'auto'}),
+            dcc.Graph(id='plot-age'),
+            dcc.Graph(id='plot-weight'),
+            dcc.Graph(id='plot-height'),
+        ])
+    elif tab == 'predict':
+        return html.Div([
+            html.H3("Eigene Eingabe testen (Einheiten beachten):"),
+            html.Label("Durchschnittsgeschwindigkeit [m/s]"),
+            dcc.Input(id='input-avg', type='number', value=3.0, step=0.1),
+            html.Label("Maximale Geschwindigkeit [m/s]"),
+            dcc.Input(id='input-max', type='number', value=5.0, step=0.1),
+            html.Label("Distanz [m]"),
+            dcc.Input(id='input-dist', type='number', value=8000, step=100),
+            html.Div(id='predict-output')
+        ])
+    else:
+        return html.Div([
+            html.Label("Datensatz anzeigen:"),
+            dcc.Dropdown(id='view-set',
+                         options=[{'label': k, 'value': k} for k in dataset_paths],
+                         value='No Anonymization'),
+            dash_table.DataTable(id='data-table', page_size=15, style_table={'overflowX': 'auto'})
+        ])
+
+# Hilfsfunktion zum Parsen von Intervallangaben durch Generalisierung (z. B. "170-180")
+def parse_interval(val):
+    if isinstance(val, str) and '-' in val:
+        parts = val.split('-')
+        try:
+            return (float(parts[0]) + float(parts[1])) / 2
+        except:
+            return np.nan
+    try:
+        return float(val)
+    except:
+        return np.nan
+
+# Auswertungstabelle erzeugen
+def create_metrics(y_true, y_pred, name):
+    return {
+        'QID': name,
+        'MAE': round(np.mean(np.abs(y_true - y_pred)), 2),
+        '≤2%': f"{np.mean(np.abs(y_true - y_pred) <= y_true * 0.02):.0%}",
+        '≤5%': f"{np.mean(np.abs(y_true - y_pred) <= y_true * 0.05):.0%}",
+        '≤10%': f"{np.mean(np.abs(y_true - y_pred) <= y_true * 0.10):.0%}",
+        '≤20%': f"{np.mean(np.abs(y_true - y_pred) <= y_true * 0.20):.0%}"
+    }
+
+# Modelltraining
+@app.callback(Output('train-status', 'children'),
+              Input('train-btn', 'n_clicks'),
+              Input('train-percent', 'value'),
+              Input('n-trees', 'value'))
+def train_model(n_clicks, percent, n_trees):
+    if n_clicks == 0:  # Verhindert erneutes Ausführen beim Initialisieren oder wenn Button nicht geklickt wurde
+        return ""
+    df = pd.read_csv(dataset_paths['No Anonymization']).dropna()
+    scaler = StandardScaler()  # Skaliert Eingabedaten, damit der Random Forest effizient arbeiten kann
+    X = scaler.fit_transform(df[input_features])  # Wendet Standardisierung auf Input-Features an
+
+    models = {}
+    for target in target_columns:
+        y = df[target].values
+        X_train, _, y_train, _ = train_test_split(X, y, train_size=percent/100, random_state=1)
+        model = RandomForestRegressor(n_estimators=n_trees, random_state=1)  # Erstellt Random Forest mit festgelegter Anzahl an Entscheidungsbäumen
+        model.fit(X_train, y_train)  # Trainiert das Modell mit Trainingsdaten
+        models[target] = model
+
+    global dataset_models
+    models['scaler'] = scaler
+    dataset_models = models
+    return f"Training abgeschlossen mit {n_trees} Bäumen"
+
+# Angriff starten und Ergebnisse ausgeben
+@app.callback([
+    Output('attack-status', 'children'),
+    Output('attack-metrics', 'data'),
+    Output('attack-metrics', 'columns'),
+    Output('plot-age', 'figure'),
+    Output('plot-weight', 'figure'),
+    Output('plot-height', 'figure')
+],
+    Input('attack-btn', 'n_clicks'),
+    Input('attack-set', 'value'))
+def attack_model(n_clicks, dataset_key):
+    if n_clicks == 0 or not dataset_models:  # Führt Angriff nur aus, wenn Modell vorhanden und Button geklickt
+        return "", [], [], go.Figure(), go.Figure(), go.Figure()
+
+    df_anon = pd.read_csv(dataset_paths[dataset_key], index_col=0).dropna()
+    df_real = pd.read_csv(dataset_paths['No Anonymization'], index_col=0).dropna()
+
+    for col in target_columns:
+        if col in df_anon.columns:
+            df_anon[col] = df_anon[col].apply(parse_interval)  # Konvertiert z. B. '170-180' zu Mittelwert 175.0
+
+    X_scaled = dataset_models['scaler'].transform(df_anon[input_features])
+    df_real = df_real.loc[df_anon.index]  # Synchronisiert Zeilen für echten und anonymisierten Datensatz
+
+    table, plots = [], {}
+    for col in target_columns:
+        model = dataset_models[col]
+        y_true = df_real[col].values
+        y_pred = model.predict(X_scaled).flatten()
+        table.append(create_metrics(y_true, y_pred, col))
+
+        fig = go.Figure([
+            go.Scatter(y=y_true, mode='markers', name='Echt', marker=dict(color='blue')),
+            go.Scatter(y=y_pred, mode='markers', name='Vorhersage', marker=dict(color='red'))
+        ])
+        fig.update_layout(title=f'{col}: Vorhersage vs Echte Werte', xaxis_title='Index', yaxis_title=col)
+        plots[col] = fig
+
+    columns = [{'name': i, 'id': i} for i in table[0].keys()]
+    return "Angriff abgeschlossen", table, columns, plots['age'], plots['weight_kg'], plots['height_cm']
+
+# Eigene Eingabe testen
+@app.callback(Output('predict-output', 'children'),
+              Input('input-avg', 'value'),
+              Input('input-max', 'value'),
+              Input('input-dist', 'value'))
+def predict_values(avg, maxv, dist):
+    if not dataset_models:  # Keine Vorhersage, wenn noch kein Modell trainiert wurde
+        return ""
+    scaler = dataset_models['scaler']
+    df = pd.DataFrame([{
+        'average_speed': avg,
+        'max_speed': maxv,
+        'distance': dist,
+        'total_elevation_gain': 0,
+        'elev_high': 0,
+        'kudos_count': 0
+    }])
+    X_scaled = scaler.transform(df[input_features])
+
+    predictions = {col: round(dataset_models[col].predict(X_scaled)[0], 2) for col in target_columns}  # Sagt Werte basierend auf Benutzereingabe voraus
+    return html.Div([
+        html.P(f"Alter: {predictions['age']} Jahre"),
+        html.P(f"Größe: {predictions['height_cm']} cm"),
+        html.P(f"Gewicht: {predictions['weight_kg']} kg")
+    ])
+
+# Datensatz anzeigen
+@app.callback(
+    Output('data-table', 'data'),
+    Output('data-table', 'columns'),
+    Input('view-set', 'value')
+)
+def show_table(dataset_key):
+    df = pd.read_csv(dataset_paths[dataset_key])
+    return df.to_dict('records'), [{'name': i, 'id': i} for i in df.columns]
+
+# App starten
+if __name__ == '__main__':
+    app.run(debug=True)
